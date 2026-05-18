@@ -85,7 +85,7 @@ class GRPOTrainer:
         self.args = args
         # 加载模型
         if isinstance(model, str):
-            model = AutoModelForCausalLM.from_pretrained(model)
+            model = AutoModelForCausalLM.from_pretrained(model) # 根据模型model或本地路径，加载一个因果语言模型
         # 策略模型，也就是训练过程中会被更新的语言模型。
         self.model = model.to(self.args.device)
         
@@ -94,25 +94,27 @@ class GRPOTrainer:
         if self.args.beta != 0.0:
             # reference model 固定不训练，用来计算 KL 惩罚，限制策略模型偏离初始模型太远。
             self.ref_model = deepcopy(model)
-            self.ref_model.eval()
+            self.ref_model.eval() # 把参考模型切换到推理模式
     
         
         if isinstance(tokenizer, str):
             tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+            # from_pretrained() 从一个已经训练好的模型/分词器名称，或者本地路径中，加载对应对象。
         
         # 统一 tokenizer 配置，当前只设置了 padding_side。
         self.tokenizer = self.get_tokenizer(tokenizer)
         
-        
+        # 如果 reward_funcs 是字符串，则转换为列表
         if isinstance(reward_funcs, str):
-            reward_funcs = [reward_funcs]
+            reward_funcs = [reward_funcs] # reward_funcs 是奖励模型路径或者 HuggingFace 模型名
         
         for i, reward_func in enumerate(reward_funcs):
             # 如果奖励函数为字符串，表示使用的是奖励模型，则加载模型
             if isinstance(reward_func, str):
                 # 字符串形式的 reward_func 被认为是奖励模型路径。
                 reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
-                    reward_func, num_labels=1).to(self.args.device)
+                    reward_func, num_labels=1).to(self.args.device) # AutoModelForSequenceClassification 是加载一个序列分类模型
+                # 奖励模型是分类/打分模型，输入一个文本，输出一个分数
         
         self.reward_funcs = reward_funcs
         
@@ -147,7 +149,7 @@ class GRPOTrainer:
         # 缓存已经生成的数据的一个批次的数据，可供模型多次训练迭代，无需重新生成
         # 缓存已经采样并计算好 reward/advantage/log_prob 的经验。
         # 当 num_iterations > 1 时，可以复用同一批经验训练多轮。
-        self.input_buffer = [None] * self.args.gradient_accumulation_steps
+        self.input_buffer = [None] * self.args.gradient_accumulation_steps # 创建一个列表作为经验缓冲区
         
         # 模型更新的次数
         # 记录真正执行 optimizer.step() 的次数。
@@ -157,7 +159,7 @@ class GRPOTrainer:
         tokenizer.padding_side = "left"
         return tokenizer
     
-    # 生成样本，以组为单位
+    # 生成样本，以组为单位 rollout
     def generate_samples(self, inputs):
         """
         对一个 batch 内的每个 prompt 生成一组回答。
@@ -166,16 +168,17 @@ class GRPOTrainer:
         元素内部包含 num_generations 条回答及其 mask。
         """
         samples_list = []
-        self.model.eval()
+        self.model.eval() # 把模型切换到推理模式，用于生成回答
         # DataLoader 会把多个样本的 prompt 聚合成 inputs['prompt'] 列表。
         prompts = [prompt for prompt in inputs['prompt']]
-        answers = [None] * len(prompts)
+        answers = [None] * len(prompts) # 兼容某些数据集没有标准答案的情况
         
         if 'answer' in inputs:
             answers = [answer for answer in inputs['answer']]
         
         # 最终固定序列长度 = prompt 最大长度 + response 最大长度。
         max_length = self.args.max_generate_length + self.args.max_prompt_length
+        # 同时遍历问题和答案
         for prompt, answer in zip(prompts, answers):
             # 应用聊天模板，加入系统提示词
             # apply_chat_template 将 system/user 消息转换成模型期望的聊天格式文本。
@@ -185,20 +188,30 @@ class GRPOTrainer:
             # 生成一个group的输入数据
             # 同一个 prompt 复制 num_generations 份，一次性采样出一个 group。
             # return_tensors='pt' 表示返回 PyTorch Tensor。
-            inputs = self.tokenizer([input_text] * self.args.num_generations, padding='max_length', max_length=self.args.max_prompt_length, truncation=True, return_tensors='pt')
-            prompt_ids = inputs['input_ids']
-            with torch.no_grad():
+            inputs = self.tokenizer(
+                [input_text] * self.args.num_generations, # 同一个 prompt 复制 num_generations 份
+                padding='max_length', 
+                max_length=self.args.max_prompt_length, 
+                truncation=True, 
+                return_tensors='pt' # 返回 PyTorch tensor
+            )
+            prompt_ids = inputs['input_ids'] # 取出 prompt 的 token ids
+
+            # 生成回答
+            # 模型预测的概率分布里随机采样生成 token
+            with torch.no_grad(): # 不计算梯度，生成样本时不需要反向传播，节省显存
                 # generate 返回 prompt + response 的完整 token 序列。
                 prompt_response_ids = self.model.generate(**inputs.to(self.args.device), 
                                     max_new_tokens = self.args.max_generate_length,
-                                    temperature=0.9,
+                                    temperature=0.9, # 控制采样随机性
                                     top_p = 1,
-                                    top_k = 50)
+                                    top_k = 50) # 每步只从概率最高的 50 个 token 中采样
                 
             # 为了后续 torch.cat，所有生成序列都整理到同一个 max_length。
             if prompt_response_ids.size(1) >= max_length:
-                prompt_response_ids = prompt_response_ids[:, :max_length]
+                prompt_response_ids = prompt_response_ids[:, :max_length] # 生成序列的完整长度超过 max_length 就截断
             else:
+                # 序列长度不够 max_length 就在后面补 pad token
                 prompt_response_ids = torch.cat([prompt_response_ids, torch.full((prompt_response_ids.size(0), max_length - prompt_response_ids.size(1)), fill_value=self.tokenizer.pad_token_id, device=prompt_response_ids.device)], dim=1)
           
             # attention_mask 标记非 pad token。
@@ -212,16 +225,16 @@ class GRPOTrainer:
             # 存储的是一个group的数据
             # 一个 Samples 对象保存同一个 prompt 的整组生成结果。
             samples = Samples(
-                prompt_response_ids=prompt_response_ids,
-                response_ids=response_ids,
+                prompt_response_ids=prompt_response_ids, # 完整的token序列，包含 prompt + response, shape 为 [num_generations, max_prompt_length + max_generate_length]
+                response_ids=response_ids, # 只包含response部分的token id序列，shape 为 [num_generations, max_generate_length]
                 prompt = prompt,
                 answer = answer,
-                attention_mask=attention_mask,
-                action_mask=action_mask,
-                num_actions=action_mask.size(1),
-                response_length=action_mask.float().sum(dim=-1)
+                attention_mask=attention_mask, # 完整序列的mask，shape 为 [num_generations, max_prompt_length + max_generate_length]
+                action_mask=action_mask, # 只包含response部分的mask，shape 为 [num_generations, max_generate_length]
+                num_actions=action_mask.size(1), # response 序列长度，最多有多少个action token位置
+                response_length=action_mask.float().sum(dim=-1) # response 序列长度，即有多少个参与策略梯度计算的token位置
             )
-            samples_list.append(samples)
+            samples_list.append(samples) 
 
         return samples_list
     
@@ -248,6 +261,7 @@ class GRPOTrainer:
         batch_old_action_log_probs = []
         batch_ref_action_log_probs = []
         
+        # 取出一个 prompt 的一组生成结果
         for samples in samples_list:
             prompt_response_ids = samples.prompt_response_ids # shape: (num_generations, seq_len)
             response_ids = samples.response_ids # shape: (num_generations, seq_len)
@@ -261,9 +275,13 @@ class GRPOTrainer:
             batch_action_mask.append(action_mask)
             
             with torch.no_grad():
-                # 计算策略模型输出token的概率
+                # 计算策略模型输出 token 的概率
                 # 记录采样策略的 log_prob，后续 PPO ratio 会用到它。
-                old_action_log_probs = self.get_action_log_probs(self.model, prompt_response_ids, attention_mask, num_actions)
+                old_action_log_probs = self.get_action_log_probs(
+                    self.model, 
+                    prompt_response_ids, 
+                    attention_mask, 
+                    num_actions)
                 batch_old_action_log_probs.append(old_action_log_probs)
                 
                 # 是否使用参考模型
@@ -280,8 +298,8 @@ class GRPOTrainer:
                 # 将输出转换成文本
                 # 将 response token 解码成文本，供奖励函数或奖励模型打分。
                 response_texts = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
-                prompt_texts = [prompt] * len(response_texts)
-                prompt_response_texts = [prompt + response for prompt, response in zip(prompt_texts, response_texts)]
+                prompt_texts = [prompt] * len(response_texts) # 把同一个prompt复制num_generations份,使它和多条response一一对应
+                prompt_response_texts = [prompt + response for prompt, response in zip(prompt_texts, response_texts)] # 拼成完整文本 prompt+response, 给奖励模型打分时使用
                 
                 for i, (reward_func, reward_tokenizer) in enumerate(
                     zip(self.reward_funcs, self.reward_tokenizers)
@@ -324,12 +342,12 @@ class GRPOTrainer:
         
                
         return {
-            "prompt_response_ids": torch.cat(batch_prompt_response_ids, dim=0),
-            "attention_mask": torch.cat(batch_attention_mask, dim=0),
-            "action_mask": torch.cat(batch_action_mask, dim=0),
-            "old_action_log_probs": torch.cat(batch_old_action_log_probs, dim=0),
-            "ref_action_log_probs": torch.cat(batch_ref_action_log_probs, dim=0) if self.ref_model else None,
-            "advantages": torch.cat(batch_advantages, dim=0),
+            "prompt_response_ids": torch.cat(batch_prompt_response_ids, dim=0), # 模型输入
+            "attention_mask": torch.cat(batch_attention_mask, dim=0), # Transformer attention mask
+            "action_mask": torch.cat(batch_action_mask, dim=0), # 参与策略梯度计算的 response token 的 mask
+            "old_action_log_probs": torch.cat(batch_old_action_log_probs, dim=0), # 采样时策略模型在 response token 上的 log_prob
+            "ref_action_log_probs": torch.cat(batch_ref_action_log_probs, dim=0) if self.ref_model else None, # 参考模型在 response token 上的 log_prob
+            "advantages": torch.cat(batch_advantages, dim=0), # 组内奖励标准化后的优势值
         }
     
     def compute_loss(self, model, inputs):
@@ -355,7 +373,7 @@ class GRPOTrainer:
             
             # k3: log_ratio.exp() - 1 - log_ratio
             # k3 是一种非负 KL 估计形式：exp(log_ratio) - 1 - log_ratio。
-            k3 = log_ratio.exp() - 1 - log_ratio
+            k3 = log_ratio.exp() - 1 - log_ratio # 恒为非负
         
         advantages = inputs['advantages']
         
@@ -382,7 +400,7 @@ class GRPOTrainer:
         
         return loss
 
-
+    # 给定一段完整序列 prompt + response，计算模型对 response 中每一个实际生成 token 的 log probability
     def get_action_log_probs(self, model, input_ids, attention_mask, num_actions):
         """
         取出模型对实际生成 token 的 log probability。
